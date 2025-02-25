@@ -49,13 +49,13 @@ func main() {
 	// 启动工作协程池
 	for i := 0; i < numWorkers*2; i++ {
 		wg.Add(1)
-		go lineWorker(lines, results, &wg)
+		go countWordsWorker(lines, results, &wg)
 	}
 
 	// 启动结果合并协程
 
 	go func() {
-		resultChan <- MergeGoroutine(results, numWorkers)
+		resultChan <- aggregateWordCounts(results, numWorkers)
 	}()
 
 	// 使用缓冲扫描器读取文件
@@ -82,7 +82,7 @@ func main() {
 }
 
 // 行处理工作协程，只能接受的通道lines，只能发送的通道res
-func lineWorker(lines <-chan string, results chan<- map[string]int, wg *sync.WaitGroup) {
+func countWordsWorker(lines <-chan string, results chan<- map[string]int, wg *sync.WaitGroup) {
 	defer wg.Done()
 	localCount := make(map[string]int) // 本地计数器
 
@@ -117,7 +117,7 @@ func splitToWords(line string) []string {
 }
 
 // 合并协程
-func MergeGoroutine(results <-chan map[string]int, workers int) []WordCount {
+func aggregateWordCounts(results <-chan map[string]int, workers int) []WordCount {
 	total := make(map[string]int) // 全局计数器
 
 	// 合并所有工作协程的结果
