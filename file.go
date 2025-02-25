@@ -3,12 +3,14 @@ package main
 
 // 导入依赖包
 import (
-	"bufio"   // 缓冲IO读写
-	"fmt"     // 格式化IO
+	"bufio" // 缓冲IO读写
+	"fmt"   // 格式化IO
+	"log"
 	"os"      // 操作系统功能
 	"runtime" // 运行时信息
 	"sort"    // 排序功能
-	"sync"    // 并发控制
+	"strings"
+	"sync" // 并发控制
 	"time"
 	"unicode" // Unicode字符处理
 )
@@ -20,51 +22,60 @@ type WordCount struct {
 }
 
 func main() {
-	// 打开文件
+	PrintMemUsage("开始读取文件前")
 	start := time.Now()
-	file, err := os.Open("/Users/anker/file_test.txt")
+	var wg sync.WaitGroup                        // 协程同步控制器
+	lines := make(chan string, 100000)           // 带缓冲的行通道（减少IO等待）
+	results := make(chan map[string]int, 100000) // 结果收集通道
+	resultChan := make(chan []WordCount, 100000)
+	buf := make([]byte, 0, 1024*1024) // 初始化1MB缓冲区
+
+	// 打开文件
+	file, err := os.OpenFile("/Users/anker/text_data.txt", os.O_RDONLY, 0) //openfile指令,改为只读
+
 	if err != nil {
 		fmt.Printf("无法打开文件: %v\n", err)
 		return
 	}
-	defer file.Close() // 确保文件关闭
-
+	// 立即设置defer并处理关闭错误
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			log.Printf("Error closing file: %v", closeErr)
+		}
+	}() // 如果移动到os.Open后，会导致空指针崩溃风险：os.Open返回错误时，file是nil。因此在错误处理之前执行defer file.Close()的话，如果err存在，file是nil，那么defer会调用nil.Close()，导致运行时错误。
 	// 初始化并发参数
-	numWorkers := runtime.NumCPU()       // 使用CPU核心数作为工作协程数
-	lines := make(chan string, 1000)     // 带缓冲的行通道（减少IO等待）
-	results := make(chan map[string]int) // 结果收集通道
-
-	var wg sync.WaitGroup // 协程同步控制器
+	numWorkers := runtime.NumCPU() // 使用CPU核心数作为工作协程数
 
 	// 启动工作协程池
-	for i := 0; i < numWorkers; i++ {
+	for i := 0; i < numWorkers*2; i++ {
 		wg.Add(1)
 		go lineWorker(lines, results, &wg)
 	}
 
 	// 启动结果合并协程
-	resultChan := make(chan []WordCount)
+
 	go func() {
-		resultChan <- processResults(results, numWorkers)
+		resultChan <- MergeGoroutine(results, numWorkers)
 	}()
 
 	// 使用缓冲扫描器读取文件
 	scanner := bufio.NewScanner(file)
-	buf := make([]byte, 0, 1024*1024) // 初始化1MB缓冲区
 	scanner.Buffer(buf, 10*1024*1024) // 设置最大行长度为10MB
 
 	// 逐行读取并发送到通道
 	for scanner.Scan() {
 		lines <- scanner.Text()
 	}
-	close(lines) // 关闭通道触发工作协程结束
 
+	//AI说这两个close是安全的，不会引发panic
+	close(lines) // 关闭通道触发工作协程结束
 	// 等待所有工作协程完成
 	wg.Wait()
 	close(results) // 关闭结果通道
 
 	// 获取排序后的结果并输出
 	sorted := <-resultChan
+	PrintMemUsage("结果排序完毕后")
 	printTopWords(sorted, 30)
 	end := time.Now()
 	fmt.Println(end.Sub(start))
@@ -87,33 +98,26 @@ func lineWorker(lines <-chan string, results chan<- map[string]int, wg *sync.Wai
 	results <- localCount
 }
 
-// 自定义分词函数
+// 分词
 func splitToWords(line string) []string {
-	var words []string
-	var word []rune // 使用rune处理Unicode
-
-	// 遍历每个字符,遇到空格或者其他不是字母的字符，就把之前存入的提交
-	for _, r := range line {
-		if unicode.IsLetter(r) { // 判断是否为字母
-			word = append(word, unicode.ToLower(r)) // 转换为小写
-		} else {
-			if len(word) > 0 { // 遇到非字母字符时提交单词
-				words = append(words, string(word))
-				word = nil // 重置缓冲区
-			}
+	fields := strings.Fields(line)
+	idx := 0
+	// words := make([]string, 0, len(fields)) // 预分配容量
+	for _, word := range fields {
+		// 使用索引操作代替多次append  AI润色的结果
+		clean := strings.TrimFunc(word, func(r rune) bool {
+			return !unicode.IsLetter(r) && !unicode.IsNumber(r)
+		})
+		if clean != "" {
+			fields[idx] = clean
+			idx++
 		}
 	}
-
-	// 处理行末的最后一个单词
-	if len(word) > 0 {
-		words = append(words, string(word))
-	}
-
-	return words
+	return fields[:idx]
 }
 
-// 合并处理结果 仅接受
-func processResults(results <-chan map[string]int, workers int) []WordCount {
+// 合并协程
+func MergeGoroutine(results <-chan map[string]int, workers int) []WordCount {
 	total := make(map[string]int) // 全局计数器
 
 	// 合并所有工作协程的结果
@@ -127,7 +131,7 @@ func processResults(results <-chan map[string]int, workers int) []WordCount {
 	return sortWordCounts(total) // 返回排序结果
 }
 
-// 排序函数
+// 排序函数      时间复杂度为O(n log n)
 func sortWordCounts(counts map[string]int) []WordCount {
 	sorted := make([]WordCount, 0, len(counts))
 
@@ -152,7 +156,6 @@ func printTopWords(sorted []WordCount, n int) {
 	if n > len(sorted) {
 		n = len(sorted)
 	}
-
 	// 格式化输出表头
 	fmt.Printf("%-6s %-20s %s\n", "排名", "单词", "频率")
 	fmt.Println("------------------------------")
@@ -161,4 +164,19 @@ func printTopWords(sorted []WordCount, n int) {
 	for i := 0; i < n; i++ {
 		fmt.Printf("%-6d %-20s %d\n", i+1, sorted[i].Word, sorted[i].Count)
 	}
+}
+
+func PrintMemUsage(tag string) {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	log.Printf("[%s] Alloc = %v MiB\tTotalAlloc = %v MiB\tSys = %v MiB\tNumGC = %v\n",
+		tag,
+		bToMb(m.Alloc),
+		bToMb(m.TotalAlloc),
+		bToMb(m.Sys),
+		m.NumGC,
+	)
+}
+func bToMb(b uint64) uint64 {
+	return b / 1024 / 1024
 }
