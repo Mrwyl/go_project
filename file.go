@@ -166,9 +166,18 @@ func printTopWords(sorted []WordCount, n int) {
 	}
 }
 
+// PrintMemUsage 用于打印当前 Go 运行时的内存使用情况。
+// 参数 tag 可以传入一个标识字符串，方便在日志中区分不同阶段的内存状态。
 func PrintMemUsage(tag string) {
 	var m runtime.MemStats
+	// 读取当前内存统计信息，存入 m 中
 	runtime.ReadMemStats(&m)
+
+	// 使用日志打印相关字段：
+	// - Alloc：当前堆上已分配且仍在使用的内存总量（字节）
+	// - TotalAlloc：程序启动至今分配过的内存总量（含已释放部分）
+	// - Sys：Go 运行时向操作系统申请的总内存
+	// - NumGC：垃圾回收 (GC) 运行的次数
 	log.Printf("[%s] Alloc = %v MiB\tTotalAlloc = %v MiB\tSys = %v MiB\tNumGC = %v\n",
 		tag,
 		bToMb(m.Alloc),
@@ -177,6 +186,8 @@ func PrintMemUsage(tag string) {
 		m.NumGC,
 	)
 }
+
+// bToMb 将字节数转换为兆字节（MiB）
 func bToMb(b uint64) uint64 {
 	return b / 1024 / 1024
 }
