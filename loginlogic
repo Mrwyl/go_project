@@ -1,0 +1,779 @@
+package logic
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strconv"
+	"sync/atomic"
+	"time"
+
+	"e.coding.anker-in.com/codingcorp/aiot_cloud_common/kit/errors/grpcerrors"
+	"e.coding.anker-in.com/codingcorp/aiot_cloud_common/kit/metadata"
+	"e.coding.anker-in.com/codingcorp/aiot_cloud_common/kit/resty/logger"
+	"e.coding.anker-in.com/codingcorp/aiot_cloud_common/protocol/codes"
+	"e.coding.anker-in.com/codingcorp/zx_alpc_cloud/account/model"
+	"e.coding.anker-in.com/codingcorp/zx_alpc_cloud/account/rpc/internal/serviceMetric"
+	"e.coding.anker-in.com/codingcorp/zx_alpc_cloud/account/rpc/internal/svc"
+	"e.coding.anker-in.com/codingcorp/zx_alpc_cloud/account/rpc/internal/types"
+	"e.coding.anker-in.com/codingcorp/zx_alpc_cloud/lps-idl/accountrpc"
+	"e.coding.anker-in.com/codingcorp/zx_alpc_cloud/lps-idl/creditrpc"
+	"github.com/go-resty/resty/v2"
+	pkgerrors "github.com/pkg/errors"
+	"github.com/zeromicro/go-zero/core/logx"
+	"gorm.io/gorm"
+)
+
+// 全局计数器，用于计算缓存命中率
+var (
+	tokenCacheRequests int64
+	tokenCacheHits     int64
+)
+
+type LoginLogic struct {
+	ctx    context.Context
+	svcCtx *svc.ServiceContext
+	logx.Logger
+	util *UtilLogic
+}
+
+func NewLoginLogic(ctx context.Context, svcCtx *svc.ServiceContext) *LoginLogic {
+	return &LoginLogic{
+		ctx:    ctx,
+		svcCtx: svcCtx,
+		Logger: logx.WithContext(ctx),
+		util:   NewUtilLogic(ctx, svcCtx),
+	}
+}
+
+// Login 登录
+/**
+	风险点：
+	第三方系统 提供的是失效token， 但是没有通知用户中心，即用户中心不知道这个 token 已经失效
+    且由于是第一次登录，本地也没有这个token信息，DB/缓存 都不存在 即积分系统需要向用户中心认证
+    结果就是：用户提供一个失效token进行登录，积分系统向用户中心认证，用户中心认证通过，积分系统认为这个token是有效的
+*/
+
+/**
+登录逻辑：
+
+1. 查询缓存redis 是否存在，
+	若存在 会直接认证通过
+	若不存在 查询用户中心 该token是否存在
+		若存在 会直接认证通过，且更新DB的token基本表&更新用户信息表，以及更新缓存
+		若不存在 认证失败
+*/
+
+func (l *LoginLogic) Login(in *accountrpc.LoginReq) (*accountrpc.LoginRsp, error) {
+	// 记录开始时间，用于计算耗时
+	startTime := time.Now()
+
+	// 记录并发请求数
+	concurrentRequestsLabels := map[string]string{
+		"method": "Login",
+	}
+	if err := l.svcCtx.MetricClient.GetCustomReporter().SetGauge(serviceMetric.MetricNameConcurrentRequests, 1.0, concurrentRequestsLabels); err != nil {
+		logx.Errorf("metricClient set gauge failed, name: %s, labels: %+v, err:%v",
+			serviceMetric.MetricNameConcurrentRequests, concurrentRequestsLabels, err)
+	}
+	// 在函数结束时减少并发请求计数
+	defer func() {
+		if err := l.svcCtx.MetricClient.GetCustomReporter().SetGauge(serviceMetric.MetricNameConcurrentRequests, -1.0, concurrentRequestsLabels); err != nil {
+			logx.Errorf("metricClient set gauge failed, name: %s, labels: %+v, err:%v",
+				serviceMetric.MetricNameConcurrentRequests, concurrentRequestsLabels, err)
+		}
+	}()
+
+	// 1. 参数校验
+	err := l.CheckParam(in)
+	if err != nil {
+		// 记录API错误率
+		apiErrorLabels := map[string]string{
+			"method":     "Login",
+			"error_type": "param_invalid",
+		}
+		if err := l.svcCtx.MetricClient.GetCustomReporter().SetGauge(serviceMetric.MetricNameAPIErrorRate, 1.0, apiErrorLabels); err != nil {
+			logx.Errorf("metricClient set gauge failed, name: %s, labels: %+v, err:%v",
+				serviceMetric.MetricNameAPIErrorRate, apiErrorLabels, err)
+		}
+
+		return nil, grpcerrors.New(codes.CodeInputParamInvalid, err.Error(), grpcerrors.FindCaller(1))
+	}
+
+	// 2. 查询缓存redis 是否存在
+	key := types.BuildTokenRedisKey(in.AppId, in.Token)
+
+	// 记录Redis操作开始时间
+	redisStartTime := time.Now()
+
+	// 增加Token缓存请求计数
+	atomic.AddInt64(&tokenCacheRequests, 1)
+
+	exit, err := l.svcCtx.RedisConn.ExistsCtx(l.ctx, key)
+
+	// 记录Redis操作耗时
+	redisLatencyLabels := map[string]string{
+		"operation": "exists",
+		"status":    "success",
+	}
+	if err != nil {
+		redisLatencyLabels["status"] = "error"
+	}
+	redisLatency := time.Since(redisStartTime).Seconds()
+	if err := l.svcCtx.MetricClient.GetCustomReporter().ObserveHistogram(serviceMetric.MetricNameRedisLatencySeconds, redisLatency, redisLatencyLabels); err != nil {
+		logx.Errorf("metricClient observe histogram failed, name: %s, labels: %+v, err:%v",
+			serviceMetric.MetricNameRedisLatencySeconds, redisLatencyLabels, err)
+	}
+
+	// 记录缓存操作
+	cacheOpLabels := map[string]string{
+		"operation": "exists",
+		"status":    "success",
+	}
+	if err := l.svcCtx.MetricClient.GetCustomReporter().AddCounter(serviceMetric.MetricNameCacheOperationsTotal, 1.0, cacheOpLabels); err != nil {
+		logx.Errorf("metricClient add counter failed, name: %s, labels: %+v, err:%v",
+			serviceMetric.MetricNameCacheOperationsTotal, cacheOpLabels, err)
+	}
+
+	if err != nil {
+		l.Errorf("token redis err=%v, token=%s", err, in.Token)
+		return nil, grpcerrors.New(codes.CodeReadRedisFailed, pkgerrors.Wrapf(err, "redis error token=%s", in.Token).Error(),
+			grpcerrors.FindCaller(1))
+	}
+
+	// 2.1 若存在 会直接认证通过
+	if exit {
+		l.Infof("token exist in redis, token=%s", in.Token)
+
+		// 增加Token缓存命中计数
+		atomic.AddInt64(&tokenCacheHits, 1)
+
+		// 记录缓存命中
+		cacheHitLabels := map[string]string{
+			"operation": "token_lookup",
+			"status":    "hit",
+		}
+		if err := l.svcCtx.MetricClient.GetCustomReporter().AddCounter(serviceMetric.MetricNameCacheHitsTotal, 1.0, cacheHitLabels); err != nil {
+			logx.Errorf("metricClient add counter failed, name: %s, labels: %+v, err:%v",
+				serviceMetric.MetricNameCacheHitsTotal, cacheHitLabels, err)
+		}
+
+		// 计算并记录Token缓存命中率
+		requests := atomic.LoadInt64(&tokenCacheRequests)
+		hits := atomic.LoadInt64(&tokenCacheHits)
+		var hitRatio float64
+		if requests > 0 {
+			hitRatio = float64(hits) / float64(requests)
+		}
+		tokenCacheHitRatioLabels := map[string]string{
+			"app_id": in.AppId,
+		}
+		if err := l.svcCtx.MetricClient.GetCustomReporter().SetGauge(serviceMetric.MetricNameTokenCacheHitRatio, hitRatio, tokenCacheHitRatioLabels); err != nil {
+			logx.Errorf("metricClient set gauge failed, name: %s, labels: %+v, err:%v",
+				serviceMetric.MetricNameTokenCacheHitRatio, tokenCacheHitRatioLabels, err)
+		}
+
+		// 记录Redis操作开始时间
+		redisGetStartTime := time.Now()
+
+		// 获取用户id
+		userBytes, err := l.svcCtx.RedisConn.GetCtx(l.ctx, key)
+
+		// 记录Redis操作耗时
+		redisGetLatencyLabels := map[string]string{
+			"operation": "get",
+			"status":    "success",
+		}
+		if err != nil {
+			redisGetLatencyLabels["status"] = "error"
+		}
+		redisGetLatency := time.Since(redisGetStartTime).Seconds()
+		if err := l.svcCtx.MetricClient.GetCustomReporter().ObserveHistogram(serviceMetric.MetricNameRedisLatencySeconds, redisGetLatency, redisGetLatencyLabels); err != nil {
+			logx.Errorf("metricClient observe histogram failed, name: %s, labels: %+v, err:%v",
+				serviceMetric.MetricNameRedisLatencySeconds, redisGetLatencyLabels, err)
+		}
+
+		if err != nil {
+			return nil, grpcerrors.New(codes.CodeReadDbFailed, err.Error(), grpcerrors.FindCaller(1))
+		}
+		var tokenData types.TokenData
+		if err = json.Unmarshal([]byte(userBytes), &tokenData); err != nil {
+			l.Errorf("Unmarshal error, toke=%s", in.Token)
+			return nil, grpcerrors.New(codes.CodeReadDbFailed, err.Error(), grpcerrors.FindCaller(1))
+		}
+
+		// 校验token是否过期
+		if time.Now().Unix() >= tokenData.TokenExpiredAt {
+			l.Errorf("token expired")
+
+			return nil, grpcerrors.New(CodesAccountOldToken, "token id old and it's time out of conf limit:7 day!", grpcerrors.FindCaller(1))
+		}
+
+		// 查询用户当前的积分区域 是否是当前区域不是当前区域 则 返回错误码 CodesAccountUserCreditNotInCurrentRegion
+		err = l.CheckUserCreditRegion(tokenData.UserID)
+		if err != nil {
+			return nil, err
+		}
+
+		// 上报登录成功指标
+		loginAttemptsLabels := map[string]string{
+			"app_id": in.AppId,
+			"status": "success",
+		}
+		if err := l.svcCtx.MetricClient.GetCustomReporter().AddCounter(serviceMetric.MetricNameLoginAttemptsTotal, float64(1), loginAttemptsLabels); err != nil {
+			logx.Errorf("metricClient add counter failed, name: %s, labels: %+v, err:%v",
+				serviceMetric.MetricNameLoginAttemptsTotal, loginAttemptsLabels, err)
+		}
+
+		// 记录登录延迟时间
+		loginLatency := time.Since(startTime).Seconds()
+		loginLatencyLabels := map[string]string{
+			"app_id":    in.AppId,
+			"status":    "success",
+			"auth_type": "redis_cache",
+		}
+		if err := l.svcCtx.MetricClient.GetCustomReporter().ObserveHistogram(serviceMetric.MetricNameLoginLatencySeconds, loginLatency, loginLatencyLabels); err != nil {
+			logx.Errorf("metricClient observe histogram failed, name: %s, labels: %+v, err:%v",
+				serviceMetric.MetricNameLoginLatencySeconds, loginLatencyLabels, err)
+		}
+
+		// 计算并记录登录成功率
+		loginSuccessRateLabels := map[string]string{
+			"app_id": in.AppId,
+			"region": l.svcCtx.Config.Region,
+		}
+		if err := l.svcCtx.MetricClient.GetCustomReporter().SetGauge(serviceMetric.MetricNameLoginSuccessRate, 1.0, loginSuccessRateLabels); err != nil {
+			logx.Errorf("metricClient set gauge failed, name: %s, labels: %+v, err:%v",
+				serviceMetric.MetricNameLoginSuccessRate, loginSuccessRateLabels, err)
+		}
+
+		return &accountrpc.LoginRsp{}, nil
+	} else {
+		// 记录缓存未命中
+		cacheMissLabels := map[string]string{
+			"operation": "token_lookup",
+			"status":    "miss",
+		}
+		if err := l.svcCtx.MetricClient.GetCustomReporter().AddCounter(serviceMetric.MetricNameCacheHitsTotal, 1.0, cacheMissLabels); err != nil {
+			logx.Errorf("metricClient add counter failed, name: %s, labels: %+v, err:%v",
+				serviceMetric.MetricNameCacheHitsTotal, cacheMissLabels, err)
+		}
+	}
+
+	// 3. 用户中心token存在 会直接认证通过， 且更新DB的token基本表&更新用户信息表，以及更新缓存
+	if _, ok := l.svcCtx.Config.UserCenterConf[in.AppId]; !ok {
+		return nil, grpcerrors.Errorf(CodesAccountUserCenterConfNotFound, in.AppId+" is invalid", grpcerrors.FindCaller(1))
+	}
+
+	// 当登录态缓存已过期，且本地token 记录存在，则认为是旧token 禁止登录
+	dbStartTime := time.Now()
+	tokenInfos, err := l.svcCtx.TUserTokenInfoModel.Find(l.ctx, &model.QueryTUserTokenInfoCmd{
+		Token: in.Token,
+		AppId: in.AppId,
+	})
+
+	// 记录数据库操作耗时
+	dbLatencyLabels := map[string]string{
+		"operation": "find",
+		"table":     "t_user_token_info",
+	}
+	dbLatency := time.Since(dbStartTime).Seconds()
+	if err := l.svcCtx.MetricClient.GetCustomReporter().ObserveHistogram(serviceMetric.MetricNameDBLatencySeconds, dbLatency, dbLatencyLabels); err != nil {
+		logx.Errorf("metricClient observe histogram failed, name: %s, labels: %+v, err:%v",
+			serviceMetric.MetricNameDBLatencySeconds, dbLatencyLabels, err)
+	}
+
+	// 记录数据库操作
+	dbOpLabels := map[string]string{
+		"operation": "find",
+		"table":     "t_user_token_info",
+		"status":    "success",
+	}
+	if err != nil {
+		dbOpLabels["status"] = "error"
+
+		// 记录数据库连接错误
+		if err != nil {
+			dbConnErrorLabels := map[string]string{
+				"error_type": "query_error",
+			}
+			if err := l.svcCtx.MetricClient.GetCustomReporter().AddCounter(serviceMetric.MetricNameDBConnectionErrors, 1.0, dbConnErrorLabels); err != nil {
+				logx.Errorf("metricClient add counter failed, name: %s, labels: %+v, err:%v",
+					serviceMetric.MetricNameDBConnectionErrors, dbConnErrorLabels, err)
+			}
+		}
+	}
+	if err := l.svcCtx.MetricClient.GetCustomReporter().AddCounter(serviceMetric.MetricNameDBOperationsTotal, 1.0, dbOpLabels); err != nil {
+		logx.Errorf("metricClient add counter failed, name: %s, labels: %+v, err:%v",
+			serviceMetric.MetricNameDBOperationsTotal, dbOpLabels, err)
+	}
+
+	if err != nil {
+		return nil, grpcerrors.New(codes.CodeReadDbFailed, err.Error(), grpcerrors.FindCaller(1))
+	}
+	if len(tokenInfos) > 0 {
+		if err := l.reValidateTokenByUsercenter(key, in.AppId, in.Token, in.AppKey); err != nil {
+			return nil, err
+		}
+
+		// 记录登录延迟时间
+		loginLatency := time.Since(startTime).Seconds()
+		loginLatencyLabels := map[string]string{
+			"app_id":    in.AppId,
+			"status":    "success",
+			"auth_type": "db_token",
+		}
+		if err := l.svcCtx.MetricClient.GetCustomReporter().ObserveHistogram(serviceMetric.MetricNameLoginLatencySeconds, loginLatency, loginLatencyLabels); err != nil {
+			logx.Errorf("metricClient observe histogram failed, name: %s, labels: %+v, err:%v",
+				serviceMetric.MetricNameLoginLatencySeconds, loginLatencyLabels, err)
+		}
+
+		return &accountrpc.LoginRsp{}, nil
+	}
+
+	// 2.2 若不存在 查询用户中心 该token是否存在
+	validateTokenResponse, err := l.requestUserCenterAuthToken(in.AppId, in.Token, in.AppKey)
+	if err != nil {
+		// 记录登录失败
+		loginAttemptsLabels := map[string]string{
+			"app_id": in.AppId,
+			"status": "failed",
+		}
+		if err := l.svcCtx.MetricClient.GetCustomReporter().AddCounter(serviceMetric.MetricNameLoginAttemptsTotal, float64(1), loginAttemptsLabels); err != nil {
+			logx.Errorf("metricClient add counter failed, name: %s, labels: %+v, err:%v",
+				serviceMetric.MetricNameLoginAttemptsTotal, loginAttemptsLabels, err)
+		}
+
+		// 计算并记录登录成功率
+		loginSuccessRateLabels := map[string]string{
+			"app_id": in.AppId,
+			"region": l.svcCtx.Config.Region,
+		}
+		if err := l.svcCtx.MetricClient.GetCustomReporter().SetGauge(serviceMetric.MetricNameLoginSuccessRate, 0.0, loginSuccessRateLabels); err != nil {
+			logx.Errorf("metricClient set gauge failed, name: %s, labels: %+v, err:%v",
+				serviceMetric.MetricNameLoginSuccessRate, loginSuccessRateLabels, err)
+		}
+
+		return nil, err
+	}
+	if len(validateTokenResponse.Data.UserId) == 0 {
+		return nil, grpcerrors.New(CodesAccountAuthTokenFromUserCenterFailed, "Auth token from user center  failed. ", grpcerrors.FindCaller(1))
+	}
+
+	// todo 查询本地信息
+	// 3.1 获取用户信息
+	responseData, err := l.requestUserCenterGetProfile(in.AppId, in.Token, in.AppKey)
+	if err != nil {
+		return nil, err
+	}
+
+	// todo 查询本地激活时间
+	// 3.2 获取用户的激活时间
+	registrationTime, err := l.util.requestUserCenterGetUserIdByEmail(responseData.Data.Email)
+	if err != nil {
+		return nil, err
+	}
+
+	// 查询用户当前的积分区域 是否是当前区域不是当前区域 则 返回错误码 CodesAccountUserCreditNotInCurrentRegion
+	err = l.CheckUserCreditRegion(responseData.Data.UserId)
+	if err != nil {
+		return nil, err
+	}
+
+	// 3.3 设置用户品牌
+	dbTxStartTime := time.Now()
+	err = l.svcCtx.GormDB.Transaction(func(tx *gorm.DB) error {
+		country, _ := metadata.GetRPCCountry(l.ctx)
+		// 3.3.1 更新用户 品牌表
+		err = l.util.SaveTBrandInfoModel(tx, responseData.Data.UserId, []string{l.svcCtx.Config.UserCenterConf[in.
+			AppId].Brand}, &country, &responseData.Data.IsSubscribe, nil)
+		if err != nil {
+			return err
+		}
+
+		// 3.3.2 更新用户基本信息表
+		err = l.util.SaveTUserInfoModel(tx, responseData.Data.Email, responseData.Data.UserId, &responseData.Data.FirstName, &responseData.Data.LastName, &registrationTime.Data.RegistedAt)
+		if err != nil {
+			return err
+		}
+
+		// 3.3.3 更新用户token表
+		err = l.util.SaveTUserTokenInfoModel(tx, in.AppId, responseData.Data.UserId, "", in.Token)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	// 记录数据库事务耗时
+	dbTxLatencyLabels := map[string]string{
+		"operation": "transaction",
+		"table":     "multiple",
+	}
+	dbTxLatency := time.Since(dbTxStartTime).Seconds()
+	if err := l.svcCtx.MetricClient.GetCustomReporter().ObserveHistogram(serviceMetric.MetricNameDBLatencySeconds, dbTxLatency, dbTxLatencyLabels); err != nil {
+		logx.Errorf("metricClient observe histogram failed, name: %s, labels: %+v, err:%v",
+			serviceMetric.MetricNameDBLatencySeconds, dbTxLatencyLabels, err)
+	}
+
+	if err != nil {
+		return nil, grpcerrors.New(codes.CodeWriteDbFailed, err.Error(), grpcerrors.FindCaller(1))
+	}
+
+	// 3.4 设置redis token缓存
+	l.Infof("start save token to redis, token=%s", in.Token)
+	if err := l.cacheTokenToRedis(key, in.AppId, responseData.Data.UserId); err != nil {
+		return nil, err
+	}
+
+	// 上报登录成功指标
+	loginAttemptsLabels := map[string]string{
+		"app_id": in.AppId,
+		"status": "success",
+	}
+	if err := l.svcCtx.MetricClient.GetCustomReporter().AddCounter(serviceMetric.MetricNameLoginAttemptsTotal, float64(1), loginAttemptsLabels); err != nil {
+		logx.Errorf("metricClient add counter failed, name: %s, labels: %+v, err:%v",
+			serviceMetric.MetricNameLoginAttemptsTotal, loginAttemptsLabels, err)
+	}
+
+	// 记录登录延迟时间
+	loginLatency := time.Since(startTime).Seconds()
+	loginLatencyLabels := map[string]string{
+		"app_id":    in.AppId,
+		"status":    "success",
+		"auth_type": "user_center",
+	}
+	if err := l.svcCtx.MetricClient.GetCustomReporter().ObserveHistogram(serviceMetric.MetricNameLoginLatencySeconds, loginLatency, loginLatencyLabels); err != nil {
+		logx.Errorf("metricClient observe histogram failed, name: %s, labels: %+v, err:%v",
+			serviceMetric.MetricNameLoginLatencySeconds, loginLatencyLabels, err)
+	}
+
+	// 计算并记录登录成功率
+	loginSuccessRateLabels := map[string]string{
+		"app_id": in.AppId,
+		"region": l.svcCtx.Config.Region,
+	}
+	if err := l.svcCtx.MetricClient.GetCustomReporter().SetGauge(serviceMetric.MetricNameLoginSuccessRate, 1.0, loginSuccessRateLabels); err != nil {
+		logx.Errorf("metricClient set gauge failed, name: %s, labels: %+v, err:%v",
+			serviceMetric.MetricNameLoginSuccessRate, loginSuccessRateLabels, err)
+	}
+
+	// 在方法结束前上报耗时指标
+	durationTime := time.Since(startTime).Milliseconds()
+	loginDurationLabels := map[string]string{
+		"app_id": in.AppId,
+		"method": "Login",
+	}
+	if err := l.svcCtx.MetricClient.GetCustomReporter().ObserveHistogram(serviceMetric.MetricNameRPCRequestDurationSeconds, float64(durationTime)/1000.0, loginDurationLabels); err != nil {
+		logx.Errorf("metricClient observe histogram failed, name: %s, labels: %+v, err:%v",
+			serviceMetric.MetricNameRPCRequestDurationSeconds, loginDurationLabels, err)
+	}
+
+	return &accountrpc.LoginRsp{}, nil
+}
+
+func (l *LoginLogic) reValidateTokenByUsercenter(redisKey, appId, token, appKey string) error {
+	validateTokenResponse, err := l.requestUserCenterAuthToken(appId, token, appKey)
+	if err != nil {
+		l.Errorf("requestUserCenterAuthToken err: %+v", err)
+		return grpcerrors.New(CodesAccountOldToken, "This is old token. Please try again login user center !", grpcerrors.FindCaller(1))
+	}
+	if len(validateTokenResponse.Data.UserId) == 0 {
+		return grpcerrors.New(CodesAccountAuthTokenFromUserCenterFailed, "Auth token from user center  failed. ", grpcerrors.FindCaller(1))
+	}
+
+	// 查询用户当前的积分区域 是否是当前区域不是当前区域 则 返回错误码 CodesAccountUserCreditNotInCurrentRegion
+	err = l.CheckUserCreditRegion(validateTokenResponse.Data.UserId)
+	if err != nil {
+		return err
+	}
+
+	if err := l.cacheTokenToRedis(redisKey, appId, validateTokenResponse.Data.UserId); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (l *LoginLogic) cacheTokenToRedis(key, appId, userId string) error {
+	if err := l.util.SaveAccountToRedis(key, &types.TokenData{
+		AppId:          appId,
+		UserID:         userId,
+		TokenExpiredAt: time.Now().Add(time.Second * time.Duration(l.svcCtx.Config.UserCenterConf[appId].TokenExpires)).Unix(),
+	}, int(l.svcCtx.Config.UserCenterConf[appId].TokenExpires)); err != nil {
+		return grpcerrors.New(codes.CodeWriteRedisFailed, err.Error(), err.Error())
+	}
+	return nil
+}
+
+func (l *LoginLogic) CheckUserCreditRegion(userId string) error {
+	// 记录开始时间，用于计算耗时
+	startTime := time.Now()
+
+	// 查询用户积分区域
+	dynamoDBUserInfo, err := l.svcCtx.CreditRpc.GetDynamoDBUserInfo(l.ctx, &creditrpc.GetDynamoDBUserInfoReq{
+		UserId: userId,
+	})
+	if err != nil {
+		return err
+	}
+
+	// 上报用户积分区域检查指标
+	regionCheckLabels := map[string]string{
+		"user_id":       userId,
+		"region":        l.svcCtx.Config.Region,
+		"target_region": dynamoDBUserInfo.Region,
+	}
+	if err := l.svcCtx.MetricClient.GetCustomReporter().AddCounter(serviceMetric.MetricNameUserCreditRegionChecksTotal, float64(1), regionCheckLabels); err != nil {
+		logx.Errorf("metricClient add counter failed, name: %s, labels: %+v, err:%v",
+			serviceMetric.MetricNameUserCreditRegionChecksTotal, regionCheckLabels, err)
+	}
+
+	// 若用户积分区域不是当前区域 则返回错误码
+	if dynamoDBUserInfo.Region == l.svcCtx.Config.Region {
+		// 上报耗时指标
+		durationTime := time.Since(startTime).Milliseconds()
+		durationLabels := map[string]string{
+			"user_id": userId,
+			"region":  l.svcCtx.Config.Region,
+			"result":  "match",
+		}
+		if err := l.svcCtx.MetricClient.GetCustomReporter().ObserveHistogram(serviceMetric.MetricNameExternalServiceCallDuration, float64(durationTime)/1000.0, durationLabels); err != nil {
+			logx.Errorf("metricClient observe histogram failed, name: %s, labels: %+v, err:%v",
+				serviceMetric.MetricNameExternalServiceCallDuration, durationLabels, err)
+		}
+		return nil
+	}
+
+	// 删除当前用户的所有token
+	// 查询用户token
+	userTokens, err := l.svcCtx.TUserTokenInfoModel.Find(l.ctx, &model.QueryTUserTokenInfoCmd{
+		UserId: userId,
+	})
+	if err != nil {
+		return grpcerrors.Errorf(codes.CodeReadDbFailed, err.Error(), grpcerrors.FindCaller(1))
+	}
+
+	// 清理缓存
+	cleanedTokens := 0
+	failedTokens := 0
+	for _, token := range userTokens {
+		key := types.BuildTokenRedisKey(token.AppId, token.Token)
+		_, err = l.svcCtx.RedisConn.DelCtx(l.ctx, key)
+		if err != nil {
+			l.Errorf("drop user: 1st DelCtx authToken err, authToken=%s, err=%v", token, err)
+			_, err := l.svcCtx.RedisConn.DelCtx(l.ctx, key)
+			if err != nil {
+				l.Errorf("drop user: 2nd DelCtx authToken err, authToken=%s, err=%v", token, err)
+				failedTokens++
+				continue
+			}
+		}
+		cleanedTokens++
+	}
+
+	// 上报清理的Token数量
+	if cleanedTokens > 0 {
+		cleanedTokensLabels := map[string]string{
+			"user_id": userId,
+		}
+		if err := l.svcCtx.MetricClient.GetCustomReporter().SetGauge(serviceMetric.MetricNameTokensCleaned, float64(cleanedTokens), cleanedTokensLabels); err != nil {
+			logx.Errorf("metricClient set gauge failed, name: %s, labels: %+v, err:%v",
+				serviceMetric.MetricNameTokensCleaned, cleanedTokensLabels, err)
+		}
+	}
+
+	// 上报清理失败的Token数量
+	if failedTokens > 0 {
+		failedTokensLabels := map[string]string{
+			"user_id": userId,
+		}
+		if err := l.svcCtx.MetricClient.GetCustomReporter().SetGauge(serviceMetric.MetricNameTokensCleanFailed, float64(failedTokens), failedTokensLabels); err != nil {
+			logx.Errorf("metricClient set gauge failed, name: %s, labels: %+v, err:%v",
+				serviceMetric.MetricNameTokensCleanFailed, failedTokensLabels, err)
+		}
+	}
+
+	// 上报区域不匹配错误
+	regionMismatchLabels := map[string]string{
+		"user_id":        userId,
+		"current_region": l.svcCtx.Config.Region,
+		"user_region":    dynamoDBUserInfo.Region,
+	}
+	if err := l.svcCtx.MetricClient.GetCustomReporter().AddCounter(serviceMetric.MetricNameRegionMismatchErrorsTotal, float64(1), regionMismatchLabels); err != nil {
+		logx.Errorf("metricClient add counter failed, name: %s, labels: %+v, err:%v",
+			serviceMetric.MetricNameRegionMismatchErrorsTotal, regionMismatchLabels, err)
+	}
+
+	// 上报耗时指标
+	durationTime := time.Since(startTime).Milliseconds()
+	durationLabels := map[string]string{
+		"user_id": userId,
+		"region":  l.svcCtx.Config.Region,
+		"result":  "mismatch",
+	}
+	if err := l.svcCtx.MetricClient.GetCustomReporter().ObserveHistogram(serviceMetric.MetricNameExternalServiceCallDuration, float64(durationTime)/1000.0, durationLabels); err != nil {
+		logx.Errorf("metricClient observe histogram failed, name: %s, labels: %+v, err:%v",
+			serviceMetric.MetricNameExternalServiceCallDuration, durationLabels, err)
+	}
+
+	return grpcerrors.Errorf(CodesAccountUserCreditNotInCurrentRegion, "user credit not in current region", grpcerrors.FindCaller(1))
+}
+
+func (l *LoginLogic) requestUserCenterGetProfile(appId, token, appKey string) (resp *types.UserProfileResponse, err error) {
+	header := make(map[string]string)
+	header[types.AppName] = appId
+	header[types.AppKey] = appKey
+	header[types.AppToken] = token
+
+	url := l.svcCtx.Config.CenterHost + types.ActionUserProfile
+	resp = &types.UserProfileResponse{}
+
+	result, err := resty.New().OnAfterResponse(logger.RestyLogger).SetTimeout(5 * time.Second).
+		R().SetHeaders(header).SetBody(nil).SetResult(resp).Get(url)
+	if err != nil {
+		// l.Errorf("err=%v", err)
+		return nil, err
+	}
+
+	if err != nil {
+		return nil, grpcerrors.Errorf(codes.CodeUserCenterFailed, err.Error(), grpcerrors.FindCaller(1))
+	}
+
+	if result == nil {
+		return nil, grpcerrors.Errorf(codes.CodeUserCenterFailed, fmt.Sprintf("/users/profile url:%s,http response nil", url), grpcerrors.FindCaller(1))
+	}
+
+	if result.StatusCode() != http.StatusOK {
+		return nil, grpcerrors.Errorf(codes.CodeUserCenterFailed, fmt.Sprintf("/users/profile url:%s,http code:%d", url, result.StatusCode()), grpcerrors.FindCaller(1))
+	}
+
+	if resp == nil || resp.Data == nil {
+		return nil, grpcerrors.Errorf(codes.CodeUserCenterFailed, fmt.Sprintf("/users/profile failed url:%s,http response nil", url), grpcerrors.FindCaller(1))
+	}
+
+	if len(resp.ErrorCode) != 0 {
+		userCenterCode, _ := strconv.Atoi(resp.ErrorCode)
+		return nil, grpcerrors.New(codes.CodeUserCenterFailed+userCenterCode,
+			resp.ErrorResponse.Error,
+			grpcerrors.FindCaller(1))
+	}
+
+	return resp, err
+}
+
+func (l *LoginLogic) requestUserCenterAuthToken(appId, token, appKey string) (resp *types.UserCenterValidateTokenResponse, err error) {
+	// 记录开始时间，用于计算耗时
+	startTime := time.Now()
+
+	header := make(map[string]string)
+	header[types.AppName] = appId
+	header[types.AppKey] = appKey
+	header[types.AppToken] = token
+
+	url := l.svcCtx.Config.CenterHost + types.ActionValidateToken
+	resp = &types.UserCenterValidateTokenResponse{}
+
+	result, err := resty.New().OnAfterResponse(logger.RestyLogger).SetTimeout(5 * time.Second).
+		R().SetHeaders(header).SetBody(nil).SetResult(resp).Get(url)
+
+	// 上报外部服务调用指标
+	durationTime := time.Since(startTime).Milliseconds()
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
+
+	externalCallLabels := map[string]string{
+		"service":   "user_center",
+		"operation": "validate_token",
+		"app_id":    appId,
+		"status":    status,
+	}
+
+	// 上报外部服务调用计数
+	if err := l.svcCtx.MetricClient.GetCustomReporter().AddCounter(serviceMetric.MetricNameExternalServiceCallsTotal, float64(1), externalCallLabels); err != nil {
+		logx.Errorf("metricClient add counter failed, name: %s, labels: %+v, err:%v",
+			serviceMetric.MetricNameExternalServiceCallsTotal, externalCallLabels, err)
+	}
+
+	// 上报外部服务调用耗时
+	if err := l.svcCtx.MetricClient.GetCustomReporter().ObserveHistogram(serviceMetric.MetricNameExternalServiceCallDuration, float64(durationTime)/1000.0, externalCallLabels); err != nil {
+		logx.Errorf("metricClient observe histogram failed, name: %s, labels: %+v, err:%v",
+			serviceMetric.MetricNameExternalServiceCallDuration, externalCallLabels, err)
+	}
+
+	// 记录用户中心延迟时间
+	userCenterLatencyLabels := map[string]string{
+		"operation": "validate_token",
+		"app_id":    appId,
+	}
+	if err := l.svcCtx.MetricClient.GetCustomReporter().ObserveHistogram(serviceMetric.MetricNameUserCenterLatencySeconds, float64(durationTime)/1000.0, userCenterLatencyLabels); err != nil {
+		logx.Errorf("metricClient observe histogram failed, name: %s, labels: %+v, err:%v",
+			serviceMetric.MetricNameUserCenterLatencySeconds, userCenterLatencyLabels, err)
+	}
+
+	if err != nil {
+		return nil, grpcerrors.Errorf(codes.CodeUserCenterFailed, err.Error(), grpcerrors.FindCaller(1))
+	}
+
+	if result == nil {
+		return nil, grpcerrors.Errorf(codes.CodeUserCenterFailed, fmt.Sprintf("validate_auth_token url:%s,http response nil", url), grpcerrors.FindCaller(1))
+	}
+
+	if result.StatusCode() != http.StatusOK {
+		return nil, grpcerrors.Errorf(codes.CodeUserCenterFailed, fmt.Sprintf("validate_auth_token url:%s,http code:%d", url, result.StatusCode()), grpcerrors.FindCaller(1))
+	}
+
+	if resp == nil || resp.Data == nil {
+		return nil, grpcerrors.Errorf(codes.CodeUserCenterFailed, fmt.Sprintf("validate_auth_token failed url:%s,http response nil", url), grpcerrors.FindCaller(1))
+	}
+
+	if len(resp.ErrorCode) != 0 {
+		userCenterCode, _ := strconv.Atoi(resp.ErrorCode)
+		return nil, grpcerrors.New(codes.CodeUserCenterFailed+userCenterCode,
+			resp.ErrorResponse.Error,
+			grpcerrors.FindCaller(1))
+	}
+
+	// 记录Token验证指标
+	tokenValidationLabels := map[string]string{
+		"app_id": appId,
+		"status": "success",
+	}
+	if err := l.svcCtx.MetricClient.GetCustomReporter().AddCounter(serviceMetric.MetricNameTokenValidationsTotal, float64(1), tokenValidationLabels); err != nil {
+		logx.Errorf("metricClient add counter failed, name: %s, labels: %+v, err:%v",
+			serviceMetric.MetricNameTokenValidationsTotal, tokenValidationLabels, err)
+	}
+
+	return resp, err
+}
+
+func (l *LoginLogic) CheckParam(in *accountrpc.LoginReq) error {
+	// app_id 不能为空
+	if len(in.AppId) == 0 {
+		return errors.New("app_id is empty")
+	}
+
+	// token 不能为空
+	if len(in.Token) == 0 {
+		return errors.New("token is empty")
+	}
+
+	// app_id 必须录入积分系统
+	if len(in.AppKey) == 0 {
+		return errors.New("user center config is not exist")
+	}
+
+	return nil
+}
+
+const (
+	CodesAccountOldToken                      = 27001 // 旧token，需要重新登录
+	CodesAccountAuthTokenFromUserCenterFailed = 27002 // 从用户中心验证token失败
+	CodesAccountUserCenterConfNotFound        = 27003 // 用户中心配置不存在
+	CodesAccountUserCreditNotInCurrentRegion  = 27004 // 用户积分信息不在当前区域
+)
